@@ -69,5 +69,6 @@ Exercice 8:
 8.a : Un notebook Jupyter n’est pas adapté à la production car il manque de reproductibilité (exécution non linéaire, états cachés) et ne garanrit pas un environnement stable (versions, dépendances).
 Il n’est pas automatisable, ne peut pas servir une API et n’est pas conçu pour le monitoring ou l’orchestration.
 Docker résout ces problèmes en fournissant un environnement isolé et reproductible.
+
 8.b : Docker Compose permet de lancer plusieurs services en une seule commande et de gérer automatiquement les réseaux, ports, dépendances et volumes.
 Dans le TP, il a permis de démarrer l’API et PostgreSQL ensemble, déjà connectés, ce qui simplifie énormément la mise en place d’un système multi-conteneurs et garantit un environnement reproductible.
