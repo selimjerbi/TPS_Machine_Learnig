@@ -100,7 +100,7 @@ Exercice 5 :
 streamflow=# SELECT COUNT(*) FROM subscriptions_profile_snapshots WHERE as_of = '2024-01-31';
  count 
 -------
-     0
+  7043
 (1 row)
 
 streamflow=# SELECT COUNT(*) FROM subscriptions_profile_snapshots WHERE as_of = '2024-02-29';
@@ -113,8 +113,10 @@ streamflow=# SELECT DISTINCT as_of FROM subscriptions_profile_snapshots;
    as_of    
 ------------
  2024-02-29
-(1 row)
-Le nombre de lignes pour 2024-02-29 est supérieur à celui de 2024-01-31, car on ajoute des observations correspondant au mois suivant (nouveaux clients, mises à jour d’abonnement,...). Les deux dates apparaissent bien dans subscriptions_profile_snapshots, ce qui confirme que les snapshots mensuels sont créés correctement.
+ 2024-01-31
+(2 rows)
+Après ingestion des mois month_000 et month_001, la table subscriptions_profile_snapshots contient 7043 lignes pour chacune des deux dates.
+Cela montre que la population d’utilisateurs avec un profil de souscription reste stable entre fin janvier et fin février dans ce jeu de données. En revanche, même si le nombre de lignes est identique, les valeurs peuvent évoluer: les snapshots figent l’état des abonnements à chaque fin de mois, ce qui permet ensuite d’analyser l’évolution temporelle sans toucher aux tables live.
 
 5.c : synthèse :
 
