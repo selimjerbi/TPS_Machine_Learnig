@@ -1,4 +1,16 @@
 services:
+  api:
+    build: ./api
+    env_file: .env
+    depends_on:
+      - postgres
+      - feast
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./api:/app
+      - ./services/feast_repo/repo:/repo
+
   postgres:
     image: postgres:16
     env_file: .env
@@ -24,7 +36,15 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - ./services/prefect:/opt/prefect/flows
-      - ./data:/data:ro
-
+      - ./data:/data              
+      - ./services/feast_repo/repo:/repo 
+  feast:
+    build: ./services/feast_repo
+    depends_on:
+      - postgres
+    environment:
+      FEAST_USAGE: "False"
+    volumes:
+      - ./services/feast_repo/repo:/repo
 volumes:
   pgdata:
