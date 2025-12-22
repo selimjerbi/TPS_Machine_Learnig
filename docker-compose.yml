@@ -28,7 +28,12 @@ services:
     build: ./services/prefect
     depends_on:
       - postgres
+      - feast
     env_file: .env
+    # IMPORTANT: on n'exécute PAS "prefect worker" pour ce TP.
+    # On garde le conteneur vivant pour pouvoir faire: docker compose exec prefect python ...
+    command: ["sh", "-lc", "sleep infinity"]
+    restart: unless-stopped
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
@@ -37,10 +42,15 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MLFLOW_EXPERIMENT: streamflow
+
+      # Pour monitor_flow.py
+      FEAST_REPO: /repo
+      REPORT_DIR: /reports/evidently
     volumes:
       - ./services/prefect:/opt/prefect/flows
       - ./data:/data
       - ./services/feast_repo/repo:/repo
+      - ./reports:/reports
 
   feast:
     build: ./services/feast_repo
@@ -56,16 +66,43 @@ services:
     command: >
       mlflow server
       --backend-store-uri sqlite:////mlflow/mlflow.db
-      --default-artifact-root mlflow-artifacts:/
+      --default-artifact-root /mlflow/artifacts
       --host 0.0.0.0
       --port 5000
       --serve-artifacts
       --artifacts-destination /mlflow/artifacts
     volumes:
       - ./mlflow-data:/mlflow
+      - mlartifacts:/mlflow/artifacts
     ports:
       - "5000:5000"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: streamflow-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./services/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: streamflow-grafana
+    restart: unless-stopped
+    volumes:
+      - ./services/grafana/provisioning:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   pgdata:
   mlartifacts:
+  grafana-data:

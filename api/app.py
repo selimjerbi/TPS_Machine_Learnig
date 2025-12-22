@@ -1,9 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
+import time
 from typing import Dict, Any, List
 
 import pandas as pd
+
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
 
 app = FastAPI()
 
@@ -13,6 +17,22 @@ model = None
 
 class PredictIn(BaseModel):
     user_id: str
+
+
+# ---------------------------
+# Prometheus metrics (SAFE labels)
+# ---------------------------
+REQUEST_COUNT = Counter(
+    "api_requests_total",
+    "Total number of API requests",
+    ["endpoint", "status"],
+)
+
+REQUEST_LATENCY = Histogram(
+    "api_request_latency_seconds",
+    "Latency of API requests in seconds",
+    ["endpoint"],
+)
 
 
 # Les 14 features attendues par ton modèle (signature MLflow)
@@ -64,7 +84,6 @@ def init():
         import mlflow
         mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
         model_name = os.getenv("MLFLOW_MODEL_NAME", "streamflow_churn")
-        # Modèle en Production (stage)
         model = mlflow.pyfunc.load_model(f"models:/{model_name}/Production")
 
 
@@ -73,69 +92,97 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/predict")
 def predict(inp: PredictIn):
-    # 1) init Feast + modèle
+    endpoint = "/predict"
+    start_time = time.time()
+
     try:
-        init()
+        # 1) init Feast + modèle
+        try:
+            init()
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model or feature store not initialized: {e}",
+            )
+
+        # 2) Récupération features online
+        try:
+            feature_dict = store.get_online_features(
+                features=FEATURES,
+                entity_rows=[{"user_id": inp.user_id}],
+            ).to_dict()
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "feast_online_lookup_failed", "message": str(e)},
+            )
+
+        # 3) Mise en forme {feature_name: scalar}
+        simple: Dict[str, Any] = {k.split(":")[-1]: v[0] for k, v in feature_dict.items()}
+
+        # 4) Sanity checks : missing / user inconnu / fenêtre materialize
+        missing = [k for k, v in simple.items() if v is None]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "missing_features",
+                    "user_id": inp.user_id,
+                    "missing": missing,
+                    "features": simple,
+                    "hint": "Vérifie que l'utilisateur existe et que feast materialize couvre la bonne fenêtre.",
+                },
+            )
+
+        # 5) Construire X exactement comme attendu (PAS de user_id)
+        X = pd.DataFrame(
+            [[simple[c] for c in MODEL_INPUT_COLUMNS]],
+            columns=MODEL_INPUT_COLUMNS
+        )
+
+        # 6) Prédiction
+        try:
+            pred = model.predict(X)
+            pred0 = pred[0] if hasattr(pred, "__len__") else pred
+            pred_int = int(pred0)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "model_predict_failed",
+                    "message": str(e),
+                    "features_used": simple,
+                },
+            )
+
+        # Metrics success
+        REQUEST_COUNT.labels(endpoint=endpoint, status="success").inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
+
+        return {
+            "user_id": inp.user_id,
+            "prediction": pred_int,
+            "features": simple,
+        }
+
+    except HTTPException as he:
+        # Metrics failure (status label safe)
+        REQUEST_COUNT.labels(endpoint=endpoint, status=str(he.status_code)).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
+        raise
+
     except Exception as e:
+        # Unknown failure
+        REQUEST_COUNT.labels(endpoint=endpoint, status="500").inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
         raise HTTPException(
             status_code=500,
-            detail=f"Model or feature store not initialized: {e}",
+            detail={"error": "unhandled_exception", "message": str(e)},
         )
-
-    # 2) Récupération features online
-    try:
-        feature_dict = store.get_online_features(
-            features=FEATURES,
-            entity_rows=[{"user_id": inp.user_id}],
-        ).to_dict()
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "feast_online_lookup_failed", "message": str(e)},
-        )
-
-    # 3) Mise en forme {feature_name: scalar}
-    simple: Dict[str, Any] = {k.split(":")[-1]: v[0] for k, v in feature_dict.items()}
-
-    # 4) Sanity checks : missing / user inconnu / fenêtre materialize
-    missing = [k for k, v in simple.items() if v is None]
-    if missing:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "missing_features",
-                "user_id": inp.user_id,
-                "missing": missing,
-                "features": simple,
-                "hint": "Vérifie que l'utilisateur existe et que feast materialize couvre la bonne fenêtre.",
-            },
-        )
-
-    # 5) Construire X exactement comme attendu (PAS de user_id)
-    # On force l'ordre des colonnes pour coller au schéma
-    X = pd.DataFrame([[simple[c] for c in MODEL_INPUT_COLUMNS]], columns=MODEL_INPUT_COLUMNS)
-
-    # 6) Prédiction
-    try:
-        pred = model.predict(X)
-        # pred peut être array/list ; on prend le 1er
-        pred0 = pred[0] if hasattr(pred, "__len__") else pred
-        # conversion robuste
-        pred_int = int(pred0)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "model_predict_failed",
-                "message": str(e),
-                "input_row": simple,
-            },
-        )
-
-    return {
-        "user_id": inp.user_id,
-        "prediction": pred_int,
-        "features": simple,
-    }
