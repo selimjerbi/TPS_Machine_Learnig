@@ -1,19 +1,22 @@
 print("=== monitor_flow.py loaded ===", flush=True)
+
 import os
 from pathlib import Path
 from pprint import pprint
 
 import pandas as pd
-from prefect import flow, task
 from sqlalchemy import create_engine
 
 from feast import FeatureStore
 
+from prefect import flow, task
+
 from evidently import Report
 from evidently.presets import DataDriftPreset, DataSummaryPreset
 from evidently.metrics import ValueDrift
-from evidently import Dataset
-from evidently import DataDefinition
+from evidently import Dataset, DataDefinition  # OK si ta version supporte ça
+
+from train_and_compare_flow import train_and_compare_flow
 
 
 # ----------------------------
@@ -40,10 +43,6 @@ def get_engine():
 
 
 def fetch_entity_df(engine, as_of: str) -> pd.DataFrame:
-    """
-    Construit le dataframe des entités nécessaire pour un historical join Feast :
-    colonnes obligatoires : user_id + event_timestamp.
-    """
     q = """
     SELECT user_id, as_of
     FROM subscriptions_profile_snapshots
@@ -61,11 +60,6 @@ def fetch_entity_df(engine, as_of: str) -> pd.DataFrame:
 
 
 def fetch_labels(engine, as_of: str) -> pd.DataFrame:
-    """
-    Essaie de récupérer des labels alignés temporellement.
-    Si un schéma riche existe (labels avec period_start), on filtre sur as_of.
-    Sinon, fallback sur (user_id, churn_label) et on injecte un event_timestamp synthétique.
-    """
     # Schéma riche
     try:
         q = """
@@ -114,17 +108,11 @@ def build_features(entity_df: pd.DataFrame) -> pd.DataFrame:
         "support_agg_90d_fv:ticket_avg_resolution_hrs_90d",
     ]
 
-    hf = store.get_historical_features(
-        entity_df=entity_df,
-        features=features,
-    )
+    hf = store.get_historical_features(entity_df=entity_df, features=features)
     return hf.to_df()
 
 
 def get_final_features(as_of: str) -> pd.DataFrame:
-    """
-    Construit un dataset final : features Feast + labels si disponibles, alignés sur (user_id, event_timestamp).
-    """
     engine = get_engine()
 
     entity_df = fetch_entity_df(engine, as_of)
@@ -181,14 +169,17 @@ def compute_target_drift(reference_df: pd.DataFrame, current_df: pd.DataFrame) -
 
 
 @task
-def run_evidently(reference_df: pd.DataFrame, current_df: pd.DataFrame, as_of_ref: str, as_of_cur: str):
+def run_evidently(reference_df: pd.DataFrame, current_df: pd.DataFrame, as_of_ref: str, as_of_cur: str) -> dict:
     Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
 
-    # >>> TODO: seuil arbitraire pour ce TP
+    # seuil Evidently interne (pas le threshold retrain)
     DRIFT_SHARE_THRESHOLD = 0.3
 
-    # >>> TODO: colonne à monitorer (si labels existants)
-    target_col = "churn_label" if "churn_label" in reference_df.columns and "churn_label" in current_df.columns else "months_active"
+    target_col = (
+        "churn_label"
+        if "churn_label" in reference_df.columns and "churn_label" in current_df.columns
+        else "months_active"
+    )
 
     metrics = [
         DataSummaryPreset(),
@@ -198,41 +189,45 @@ def run_evidently(reference_df: pd.DataFrame, current_df: pd.DataFrame, as_of_re
 
     report = Report(metrics=metrics)
 
-    eval_result = report.run(
+    result = report.run(
         reference_data=build_dataset_from_df(reference_df),
         current_data=build_dataset_from_df(current_df),
     )
 
     html_path = Path(REPORT_DIR) / f"drift_{as_of_ref}_vs_{as_of_cur}.html"
     json_path = Path(REPORT_DIR) / f"drift_{as_of_ref}_vs_{as_of_cur}.json"
-    eval_result.save_html(str(html_path))
-    eval_result.save_json(str(json_path))
 
-    summary = eval_result.dict()
+    result.save_html(str(html_path))
+    result.save_json(str(json_path))
+
+    summary = result.dict()
     pprint(summary)
 
-    drift_share = None
+    drift_share = 0.0
     for metric in summary.get("metrics", []):
-        if "DriftedColumnsCount" in metric.get("metric_id", ""):
-            drift_share = metric["value"]["share"]
-
-    if drift_share is None:
-        drift_share = 0.0
+        mid = metric.get("metric_id", "")
+        if "DriftedColumnsCount" in mid:
+            val = metric.get("value", {})
+            if isinstance(val, dict) and "share" in val:
+                drift_share = float(val["share"])
 
     return {"html": str(html_path), "json": str(json_path), "drift_share": float(drift_share)}
 
 
+
 @task
-def decide_action(as_of_ref: str, as_of_cur: str, drift_share: float, target_drift: float, threshold: float = 0.3) -> str:
+def decide_action(
+    as_of_ref: str,
+    as_of_cur: str,
+    drift_share: float,
+    target_drift: float,
+    threshold: float = 0.02,
+) -> str:
+    # target_drift est calculé pour info (on ne l’utilise pas comme trigger ici)
     if drift_share >= threshold:
-        return (
-            f"RETRAINING_TRIGGERED (SIMULÉ) drift_share={drift_share:.2f} >= {threshold:.2f} "
-            f"(target_drift={target_drift if target_drift == target_drift else 'NaN'})"
-        )
-    return (
-        f"NO_ACTION drift_share={drift_share:.2f} < {threshold:.2f} "
-        f"(target_drift={target_drift if target_drift == target_drift else 'NaN'})"
-    )
+        decision = train_and_compare_flow(as_of=as_of_cur)
+        return f"RETRAINING_TRIGGERED drift_share={drift_share:.2f} >= {threshold:.2f} -> {decision}"
+    return f"NO_ACTION drift_share={drift_share:.2f} < {threshold:.2f}"
 
 
 # ----------------------------
@@ -242,7 +237,7 @@ def decide_action(as_of_ref: str, as_of_cur: str, drift_share: float, target_dri
 def monitor_month_flow(
     as_of_ref: str = AS_OF_REF_DEFAULT,
     as_of_cur: str = AS_OF_CUR_DEFAULT,
-    threshold: float = 0.3,
+    threshold: float = 0.02,
 ):
     ref_df = build_dataset(as_of_ref)
     cur_df = build_dataset(as_of_cur)
