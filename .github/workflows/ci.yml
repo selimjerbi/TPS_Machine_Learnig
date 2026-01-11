@@ -22,7 +22,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          pytest -q
+          python -m pytest -q tests/unit
 
   integration:
     runs-on: ubuntu-latest
